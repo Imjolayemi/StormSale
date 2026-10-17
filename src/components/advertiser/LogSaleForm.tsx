@@ -24,6 +24,7 @@ import {
   lockConversionRate,
   type SupportedCurrency,
   type OracleRateData,
+  type ConversionResult,
 } from "../../lib/oracleEngine";
 import { ConversionRateEngine } from "./ConversionRateEngine";
 import { Shield, Zap, Users, FileKey, Coins } from "lucide-react";
@@ -50,21 +51,43 @@ export const LogSaleForm = () => {
       .catch((err) => console.error("Initial oracle load failed:", err));
   }, []);
 
+  // Missing or stale fiat rate check
+  const isFiatRateMissingOrStale =
+    inputCurrency !== "XLM" &&
+    (!oracleData ||
+      !oracleData.rates[inputCurrency] ||
+      oracleData.rates[inputCurrency]! <= 0 ||
+      oracleData.source === "Unavailable" ||
+      oracleData.isStale);
+
   // Live conversion calculations
   const numAmount = parseFloat(saleInputAmount) || 0;
-  const conversionResult = oracleData
-    ? convertFiatToXlm(numAmount, inputCurrency, oracleData)
-    : {
-        fiatAmount: numAmount,
-        fiatCurrency: inputCurrency,
-        xlmAmount: numAmount,
-        rateUsed: 1,
-        timestamp: new Date().toISOString(),
-        source: "Fallback Cache" as const,
-        isStale: true,
-      };
+  let conversionResult: ConversionResult | null = null;
+  if (inputCurrency === "XLM") {
+    conversionResult = {
+      fiatAmount: numAmount,
+      fiatCurrency: "XLM",
+      xlmAmount: numAmount,
+      rateUsed: 1,
+      timestamp: new Date().toISOString(),
+      source: oracleData?.source || "Fallback Cache",
+      isStale: false,
+    };
+  } else if (
+    oracleData &&
+    oracleData.rates[inputCurrency] &&
+    oracleData.rates[inputCurrency]! > 0 &&
+    oracleData.source !== "Unavailable"
+  ) {
+    try {
+      conversionResult = convertFiatToXlm(numAmount, inputCurrency, oracleData);
+    } catch {
+      conversionResult = null;
+    }
+  }
 
-  const calculatedXlmString = numAmount > 0 ? conversionResult.xlmAmount.toFixed(4) : "";
+  const calculatedXlmString =
+    numAmount > 0 && conversionResult ? conversionResult.xlmAmount.toFixed(4) : "";
 
   const handleLogSale = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -86,22 +109,61 @@ export const LogSaleForm = () => {
       return;
     }
 
+    if (isFiatRateMissingOrStale) {
+      showNotification({
+        type: "warning",
+        title: "Rates Unavailable",
+        message: "Live exchange rates are not loaded yet or are currently unavailable. Try again in a moment.",
+      });
+      return;
+    }
+
     setIsLoading(true);
     try {
       const campaignContract = getCampaignContract(campaignAddress);
 
+      // Refresh rate before locking to guarantee zero slippage with fresh oracle data
+      let lockData = oracleData;
+      try {
+        lockData = await getLiveOracleRates();
+        setOracleData(lockData);
+      } catch {
+        lockData = oracleData;
+      }
+
+      if (inputCurrency !== "XLM") {
+        const rate = lockData?.rates[inputCurrency];
+        if (!rate || rate <= 0 || lockData?.source === "Unavailable" || lockData?.isStale) {
+          showNotification({
+            type: "warning",
+            title: "Live Rate Required",
+            message: "Unable to retrieve a fresh live rate. Please retry or submit directly in XLM.",
+          });
+          setIsLoading(false);
+          return;
+        }
+      }
+
       // Lock current oracle rate into immutable metadata
-      const lockedRateMetadata = oracleData
-        ? lockConversionRate(numAmount, inputCurrency, oracleData)
-        : {
-            originalAmount: numAmount,
-            originalCurrency: inputCurrency,
-            convertedXlmAmount: calculatedXlmString,
-            exchangeRate: conversionResult.rateUsed,
-            oracleProvider: "Fallback Cache" as const,
-            rateTimestamp: new Date().toISOString(),
-            isStaleAtLock: true,
-          };
+      const lockedRateMetadata =
+        inputCurrency === "XLM" || lockData
+          ? lockConversionRate(
+              numAmount,
+              inputCurrency,
+              lockData || {
+                rates: { USD: 1 },
+                timestamp: Date.now(),
+                source: "Fallback Cache",
+                isStale: false,
+              },
+            )
+          : null;
+
+      if (!lockedRateMetadata) {
+        throw new Error("Unable to lock conversion rate metadata.");
+      }
+
+      const xlmToLog = lockedRateMetadata.convertedXlmAmount;
 
       showNotification({
         type: "info",
@@ -140,12 +202,12 @@ export const LogSaleForm = () => {
       showNotification({
         type: "info",
         title: "Transaction Submitted",
-        message: `Logging encrypted sale (${calculatedXlmString} XLM)...`,
+        message: `Logging encrypted sale (${xlmToLog} XLM)...`,
       });
 
       const tx = await campaignContract.logEncryptedSale(
         affiliateAddress,
-        calculatedXlmString,
+        xlmToLog,
         encryptedPayload,
         advertiserWrappedKey,
         affiliateWrappedKey,
@@ -162,7 +224,7 @@ export const LogSaleForm = () => {
           campaignAddress,
           affiliateAddress,
           advertiserAddress: userAddress || "GADVERTISER_DEFAULT_TESTNET",
-          saleAmount: calculatedXlmString,
+          saleAmount: xlmToLog,
           currency: "XLM",
           stellarTxHash: postbackTxHash,
           ledgerTimestamp: new Date().toISOString(),
@@ -196,7 +258,7 @@ export const LogSaleForm = () => {
       showNotification({
         type: "success",
         title: "Sale Logged Successfully!",
-        message: `Recorded ${calculatedXlmString} XLM (locked from ${numAmount} ${inputCurrency}) on-chain.`,
+        message: `Recorded ${xlmToLog} XLM (locked from ${numAmount} ${inputCurrency}) on-chain.`,
       });
 
       setAffiliateAddress("");
@@ -241,12 +303,19 @@ export const LogSaleForm = () => {
       {/* Optional Expanded Oracle Live View */}
       {showFullOracleEngine && (
         <div className="mb-6">
-          <ConversionRateEngine />
+          <ConversionRateEngine
+            data={oracleData}
+            onRefresh={() => void getLiveOracleRates(true).then(setOracleData)}
+          />
         </div>
       )}
 
       {/* Compact Oracle Status Ribbon */}
-      <ConversionRateEngine compact />
+      <ConversionRateEngine
+        compact
+        data={oracleData}
+        onRefresh={() => void getLiveOracleRates(true).then(setOracleData)}
+      />
 
       <Card className="border border-slate-200 dark:border-zinc-800 shadow-sm rounded-3xl bg-white dark:bg-zinc-900/50">
         <CardHeader className="pb-6 pt-8 px-8">
@@ -400,8 +469,8 @@ export const LogSaleForm = () => {
 
               <Button
                 type="submit"
-                disabled={isLoading}
-                className="w-full h-14 bg-zinc-900 hover:bg-zinc-800 dark:bg-indigo-600 dark:hover:bg-indigo-500 text-white text-lg font-bold shadow-lg rounded-xl transition-all"
+                disabled={isLoading || isFiatRateMissingOrStale}
+                className="w-full h-14 bg-zinc-900 hover:bg-zinc-800 dark:bg-indigo-600 dark:hover:bg-indigo-500 text-white text-lg font-bold shadow-lg rounded-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isLoading ? (
                   <div className="flex items-center space-x-3">

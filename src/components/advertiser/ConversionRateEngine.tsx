@@ -12,12 +12,18 @@ import {
 import { RefreshCw, Clock, Coins, ArrowRightLeft, Sparkles, Layers } from "lucide-react";
 
 interface ConversionRateEngineProps {
-  onRateSelected?: (currency: SupportedCurrency, rate: number) => void;
   compact?: boolean;
+  data?: OracleRateData | null;
+  onRefresh?: () => void;
 }
 
-export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({ compact = false }) => {
-  const [oracleData, setOracleData] = useState<OracleRateData | null>(null);
+export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({
+  compact = false,
+  data: externalData,
+  onRefresh,
+}) => {
+  const [internalData, setInternalData] = useState<OracleRateData | null>(null);
+  const oracleData = externalData !== undefined ? externalData : internalData;
   const [isLoading, setIsLoading] = useState(false);
   const [freshnessText, setFreshnessText] = useState("");
 
@@ -25,31 +31,44 @@ export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({ comp
   const [calcAmount, setCalcAmount] = useState<string>("100");
   const [calcCurrency, setCalcCurrency] = useState<SupportedCurrency>("USD");
 
-  const loadRates = useCallback(async (force = false) => {
-    setIsLoading(true);
-    try {
-      const data = await getLiveOracleRates(force);
-      setOracleData(data);
-      setFreshnessText(formatFreshness(data.timestamp));
-    } catch (err) {
-      console.error("Failed to load oracle rates:", err);
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
-
-  // Initial load and periodic timer for freshness text and auto-refresh
-  useEffect(() => {
-    loadRates();
-
-    const interval = setInterval(() => {
-      if (oracleData) {
-        setFreshnessText(formatFreshness(oracleData.timestamp));
+  const loadRates = useCallback(
+    async (force = false) => {
+      if (onRefresh && force) {
+        onRefresh();
+        return;
       }
+      setIsLoading(true);
+      try {
+        const data = await getLiveOracleRates(force);
+        setInternalData(data);
+        setFreshnessText(formatFreshness(data.timestamp));
+      } catch (err) {
+        console.error("Failed to load oracle rates:", err);
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [onRefresh],
+  );
+
+  // Initial load effect: load only if not controlled externally
+  useEffect(() => {
+    if (externalData === undefined) {
+      void loadRates();
+    }
+  }, [loadRates, externalData]);
+
+  // Separate freshness timer effect keyed to oracleData
+  useEffect(() => {
+    if (!oracleData || oracleData.timestamp === 0) return;
+    const ts = oracleData.timestamp;
+    setFreshnessText(formatFreshness(ts));
+    const interval = setInterval(() => {
+      setFreshnessText(formatFreshness(ts));
     }, 5000);
 
     return () => clearInterval(interval);
-  }, [loadRates, oracleData]);
+  }, [oracleData]);
 
   if (!oracleData) {
     return (
@@ -66,7 +85,12 @@ export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({ comp
 
   const { rates, isStale, source } = oracleData;
   const numAmount = parseFloat(calcAmount) || 0;
-  const converted = convertFiatToXlm(numAmount, calcCurrency, oracleData);
+  let convertedAmount = 0;
+  try {
+    convertedAmount = convertFiatToXlm(numAmount, calcCurrency, oracleData).xlmAmount;
+  } catch {
+    convertedAmount = 0;
+  }
 
   if (compact) {
     return (
@@ -118,7 +142,7 @@ export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({ comp
               XLM / USD
             </div>
             <div className="text-sm font-extrabold text-zinc-900 dark:text-white mt-0.5">
-              ${rates.USD.toFixed(4)}
+              {rates.USD && rates.USD > 0 ? `$${rates.USD.toFixed(4)}` : "Unavailable"}
             </div>
           </div>
           <div className="p-2.5 rounded-xl bg-white dark:bg-zinc-900 border border-slate-200/60 dark:border-zinc-800/80">
@@ -126,7 +150,7 @@ export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({ comp
               XLM / EUR
             </div>
             <div className="text-sm font-extrabold text-zinc-900 dark:text-white mt-0.5">
-              €{rates.EUR.toFixed(4)}
+              {rates.EUR && rates.EUR > 0 ? `€${rates.EUR.toFixed(4)}` : "Unavailable"}
             </div>
           </div>
           <div className="p-2.5 rounded-xl bg-white dark:bg-zinc-900 border border-slate-200/60 dark:border-zinc-800/80">
@@ -134,7 +158,7 @@ export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({ comp
               XLM / USDC
             </div>
             <div className="text-sm font-extrabold text-zinc-900 dark:text-white mt-0.5">
-              ${rates.USDC.toFixed(4)}
+              {rates.USDC && rates.USDC > 0 ? `$${rates.USDC.toFixed(4)}` : "Unavailable"}
             </div>
           </div>
         </div>
@@ -216,10 +240,12 @@ export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({ comp
               </span>
             </div>
             <div className="text-2xl font-black text-zinc-900 dark:text-white mt-2">
-              ${rates.USD.toFixed(4)}
+              {rates.USD && rates.USD > 0 ? `$${rates.USD.toFixed(4)}` : "Unavailable"}
             </div>
             <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1">
-              $1.00 USD = {(1 / rates.USD).toFixed(3)} XLM
+              {rates.USD && rates.USD > 0
+                ? `$1.00 USD = ${(1 / rates.USD).toFixed(3)} XLM`
+                : "Rate unavailable"}
             </div>
           </div>
 
@@ -233,10 +259,12 @@ export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({ comp
               </span>
             </div>
             <div className="text-2xl font-black text-zinc-900 dark:text-white mt-2">
-              €{rates.EUR.toFixed(4)}
+              {rates.EUR && rates.EUR > 0 ? `€${rates.EUR.toFixed(4)}` : "Unavailable"}
             </div>
             <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1">
-              €1.00 EUR = {(1 / rates.EUR).toFixed(3)} XLM
+              {rates.EUR && rates.EUR > 0
+                ? `€1.00 EUR = ${(1 / rates.EUR).toFixed(3)} XLM`
+                : "Rate unavailable"}
             </div>
           </div>
 
@@ -250,10 +278,12 @@ export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({ comp
               </span>
             </div>
             <div className="text-2xl font-black text-zinc-900 dark:text-white mt-2">
-              ${rates.USDC.toFixed(4)}
+              {rates.USDC && rates.USDC > 0 ? `$${rates.USDC.toFixed(4)}` : "Unavailable"}
             </div>
             <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1">
-              1.00 USDC = {(1 / rates.USDC).toFixed(3)} XLM
+              {rates.USDC && rates.USDC > 0
+                ? `1.00 USDC = ${(1 / rates.USDC).toFixed(3)} XLM`
+                : "Rate unavailable"}
             </div>
           </div>
         </div>
@@ -286,6 +316,7 @@ export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({ comp
                   className="h-11 rounded-xl pr-20 bg-white dark:bg-zinc-900 font-semibold"
                 />
                 <select
+                  aria-label="Calculator currency"
                   value={calcCurrency}
                   onChange={(e) => setCalcCurrency(e.target.value as SupportedCurrency)}
                   className="absolute right-1.5 top-1/2 -translate-y-1/2 h-8 px-2 bg-slate-100 dark:bg-zinc-800 border-0 rounded-lg text-xs font-bold text-zinc-700 dark:text-zinc-300 cursor-pointer"
@@ -308,11 +339,12 @@ export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({ comp
                   Equivalent:
                 </span>
                 <span className="text-base font-extrabold text-indigo-600 dark:text-indigo-300">
-                  {converted.xlmAmount.toLocaleString(undefined, {
-                    minimumFractionDigits: 2,
-                    maximumFractionDigits: 4,
-                  })}{" "}
-                  XLM
+                  {convertedAmount > 0
+                    ? `${convertedAmount.toLocaleString(undefined, {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 4,
+                      })} XLM`
+                    : "—"}
                 </span>
               </div>
             </div>
@@ -325,7 +357,7 @@ export const ConversionRateEngine: React.FC<ConversionRateEngineProps> = ({ comp
             <span className="flex items-center">
               <Layers className="w-3.5 h-3.5 mr-1 text-zinc-400" />
               Soroban Pyth Feed ID:{" "}
-              <code className="ml-1 text-[10px] text-zinc-400 font-mono">0x2b89...e53b</code>
+              <code className="ml-1 text-[10px] text-zinc-400 font-mono">0xb7a8...a850</code>
             </span>
           </div>
           <span>Lock-in exchange rate timestamp guarantees zero slippage on logged sales.</span>
